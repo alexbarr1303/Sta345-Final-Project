@@ -2,3 +2,536 @@
 title: "AlexWorkflow"
 format: html
 ---
+
+```{r}
+library(tidyverse)
+games <- read_csv("data/combined.csv")
+ 
+```
+
+```{r}
+# Map round_of to round number (paper convention: Round 1 = R64, ..., Round 6 = NCG)
+games <- games %>%
+  mutate(round = case_when(
+    round_of == 64 ~ 1,
+    round_of == 32 ~ 2,
+    round_of == 16 ~ 3,
+    round_of ==  8 ~ 4,
+    round_of ==  4 ~ 5,
+    round_of ==  2 ~ 6
+  ))
+ 
+# Verify structure
+games %>% count(round, round_of)
+games %>% summarise(min_year = min(year), max_year = max(year), n_games = n())
+```
+
+```{r}
+clamp <- function(x, lo, hi) pmax(lo, pmin(hi, x))
+ 
+compute_alpha <- function(p_bar, s1, s2) {
+  if (s1 == s2) return(0)
+  if (p_bar >= 1) return(2)
+  if (p_bar <= 0) return(-2)
+  logit_p <- log(p_bar / (1 - p_bar))
+  alpha <- logit_p / (log(1/s1) - log(1/s2))
+  clamp(alpha, -2, 2)
+}
+ 
+power_model_prob <- function(alpha, s1, s2) {
+  if (s1 == s2) return(0.5)
+  s2^alpha / (s1^alpha + s2^alpha)
+}
+ 
+build_power_model <- function(data, train_years) {
+  train <- data %>%
+    filter(year %in% train_years) %>%
+    mutate(
+      s1 = pmin(winning_team_seed, losing_team_seed),
+      s2 = pmax(winning_team_seed, losing_team_seed),
+      s1_won = (winning_team_seed == s1)
+    )
+  
+  # Round 1: matchup-specific alphas
+  r1 <- train %>%
+    filter(round == 1) %>%
+    group_by(s1, s2) %>%
+    summarise(p_bar = mean(s1_won), n = n(), .groups = "drop") %>%
+    rowwise() %>%
+    mutate(alpha = compute_alpha(p_bar, s1, s2)) %>%
+    ungroup()
+  
+  # Rounds 2-6: weighted average alpha per round
+  later <- train %>%
+    filter(round >= 2, s1 != s2) %>%
+    group_by(round, s1, s2) %>%
+    summarise(p_bar = mean(s1_won), n = n(), .groups = "drop") %>%
+    rowwise() %>%
+    mutate(alpha = compute_alpha(p_bar, s1, s2)) %>%
+    ungroup()
+  
+  round_alphas <- later %>%
+    group_by(round) %>%
+    summarise(alpha_bar = weighted.mean(alpha, w = n), .groups = "drop")
+  
+  list(r1_alphas = r1, round_alphas = round_alphas)
+}
+ 
+# --- Build 16x16x6 probability lookup matrix ---------------------------------
+# This is the key optimization: one matrix lookup per game instead of dplyr filter
+ 
+build_prob_matrix <- function(model) {
+  # prob_mat[s1, s2, round] = P(s1 beats s2) for s1 < s2 (stronger seed)
+  # For s1 > s2, use 1 - prob_mat[s2, s1, round]
+  # For s1 == s2, use 0.5
+  mat <- array(0.5, dim = c(16, 16, 6))
+  
+  # Get round-level alphas (rounds 2-6)
+  round_alpha_lookup <- rep(1, 6)  # default
+  for (i in seq_len(nrow(model$round_alphas))) {
+    rnd <- model$round_alphas$round[i]
+    round_alpha_lookup[rnd] <- model$round_alphas$alpha_bar[i]
+  }
+  
+  # Build Round 1 lookup from matchup-specific alphas
+  r1 <- model$r1_alphas
+  # First, set all Round 1 entries using a default alpha
+  # (in case a matchup hasn't been observed)
+  default_r1_alpha <- if (1 %in% model$round_alphas$round) {
+    model$round_alphas %>% filter(round == 1) %>% pull(alpha_bar)
+  } else {
+    1.0
+  }
+  if (length(default_r1_alpha) == 0) default_r1_alpha <- 1.0
+  
+  for (s1 in 1:15) {
+    for (s2 in (s1+1):16) {
+      # Round 1: check for matchup-specific alpha
+      row <- r1 %>% filter(.data$s1 == !!s1, .data$s2 == !!s2)
+      if (nrow(row) > 0) {
+        alpha <- row$alpha[1]
+      } else {
+        alpha <- default_r1_alpha
+      }
+      p <- power_model_prob(alpha, s1, s2)
+      mat[s1, s2, 1] <- p
+      mat[s2, s1, 1] <- 1 - p
+      
+      # Rounds 2-6: use round-level alpha
+      for (rnd in 2:6) {
+        p <- power_model_prob(round_alpha_lookup[rnd], s1, s2)
+        mat[s1, s2, rnd] <- p
+        mat[s2, s1, rnd] <- 1 - p
+      }
+    }
+  }
+  
+  mat
+}
+```
+
+```{r}
+# Region bracket pairings (standard NCAA bracket order)
+REGION_SEEDS <- matrix(c(
+  1, 16,  8, 9,  5, 12,  4, 13,
+  6, 11,  3, 14, 7, 10,  2, 15
+), ncol = 2, byrow = TRUE)
+ 
+# Simulate one game using the pre-computed matrix
+sim_game <- function(seed_a, seed_b, rnd, prob_mat) {
+  p_a <- prob_mat[seed_a, seed_b, rnd]  # P(seed_a wins)
+  if (runif(1) < p_a) seed_a else seed_b
+}
+ 
+# Simulate a full region (rounds 1-4), returns list of winners per round
+simulate_region <- function(prob_mat) {
+  # Round 1: 8 games
+  r1 <- integer(8)
+  for (i in 1:8) {
+    r1[i] <- sim_game(REGION_SEEDS[i, 1], REGION_SEEDS[i, 2], 1L, prob_mat)
+  }
+  # Round 2: 4 games
+  r2 <- integer(4)
+  for (i in 1:4) {
+    r2[i] <- sim_game(r1[2*i - 1], r1[2*i], 2L, prob_mat)
+  }
+  # Round 3: 2 games
+  r3 <- integer(2)
+  r3[1] <- sim_game(r2[1], r2[2], 3L, prob_mat)
+  r3[2] <- sim_game(r2[3], r2[4], 3L, prob_mat)
+  # Round 4: 1 game
+  r4 <- sim_game(r3[1], r3[2], 4L, prob_mat)
+  
+  list(r1 = r1, r2 = r2, r3 = r3, r4 = r4)
+}
+ 
+# Simulate full bracket
+simulate_bracket <- function(prob_mat) {
+  reg <- lapply(1:4, function(i) simulate_region(prob_mat))
+  f4 <- c(reg[[1]]$r4, reg[[2]]$r4, reg[[3]]$r4, reg[[4]]$r4)
+  f4w <- c(sim_game(f4[1], f4[2], 5L, prob_mat),
+           sim_game(f4[3], f4[4], 5L, prob_mat))
+  champ <- sim_game(f4w[1], f4w[2], 6L, prob_mat)
+  list(regions = reg, f4_seeds = f4, f4_winners = f4w, champion = champ)
+}
+```
+
+```{r}
+# R64: basic, simulate everything from Round 1
+gen_R64 <- function(prob_mat) {
+  simulate_bracket(prob_mat)
+}
+ 
+# Pick Favorite: deterministic, always pick the stronger seed
+gen_PF <- function() {
+  reg <- lapply(1:4, function(i) {
+    r1 <- pmin(REGION_SEEDS[, 1], REGION_SEEDS[, 2])
+    r2 <- integer(4)
+    for (j in 1:4) r2[j] <- min(r1[2*j - 1], r1[2*j])
+    r3 <- c(min(r2[1], r2[2]), min(r2[3], r2[4]))
+    r4 <- min(r3[1], r3[2])
+    list(r1 = r1, r2 = r2, r3 = r3, r4 = r4)
+  })
+  f4 <- sapply(reg, function(r) r$r4)
+  f4w <- c(min(f4[1], f4[2]), min(f4[3], f4[4]))
+  list(regions = reg, f4_seeds = f4, f4_winners = f4w, champion = min(f4w))
+}
+ 
+# Truncated geometric sampler
+sample_trunc_geom <- function(n, q, imax = 16) {
+  probs <- q * (1 - q)^(0:(imax - 1))
+  probs <- probs / sum(probs)
+  sample.int(imax, size = n, replace = TRUE, prob = probs)
+}
+ 
+# F4A: anchor at Final Four — sample 4 F4 seeds, simulate last 3 games
+gen_F4A <- function(prob_mat, q_f4) {
+  f4 <- sample_trunc_geom(4, q_f4)
+  # Simulate regions normally for early-round scoring
+  reg <- lapply(1:4, function(i) {
+    r <- simulate_region(prob_mat)
+    r$r4 <- f4[i]  # override region winner
+    r
+  })
+  f4w <- c(sim_game(f4[1], f4[2], 5L, prob_mat),
+           sim_game(f4[3], f4[4], 5L, prob_mat))
+  champ <- sim_game(f4w[1], f4w[2], 6L, prob_mat)
+  list(regions = reg, f4_seeds = f4, f4_winners = f4w, champion = champ)
+}
+ 
+# E8: anchor at Elite Eight — sample 2 E8 seeds per region, simulate from there
+gen_E8 <- function(prob_mat, q_e8) {
+  reg <- lapply(1:4, function(i) {
+    r <- simulate_region(prob_mat)
+    e8 <- sample_trunc_geom(2, q_e8)
+    r$r3 <- e8  # override S16 winners
+    r$r4 <- sim_game(e8[1], e8[2], 4L, prob_mat)
+    r
+  })
+  f4 <- sapply(reg, function(r) r$r4)
+  f4w <- c(sim_game(f4[1], f4[2], 5L, prob_mat),
+           sim_game(f4[3], f4[4], 5L, prob_mat))
+  champ <- sim_game(f4w[1], f4w[2], 6L, prob_mat)
+  list(regions = reg, f4_seeds = f4, f4_winners = f4w, champion = champ)
+}
+ 
+# NCG: anchor at championship — sample 2 NCG seeds, simulate the final
+gen_NCG <- function(prob_mat, q_ncg) {
+  ncg <- sample_trunc_geom(2, q_ncg)
+  reg <- lapply(1:4, function(i) simulate_region(prob_mat))
+  f4 <- sapply(reg, function(r) r$r4)
+  f4w <- ncg  # override F4 winners
+  champ <- sim_game(ncg[1], ncg[2], 6L, prob_mat)
+  list(regions = reg, f4_seeds = f4, f4_winners = f4w, champion = champ)
+}
+```
+
+```{r}
+ESPN_POINTS <- c(10L, 20L, 40L, 80L, 160L, 320L)
+ 
+# Pre-extract actual results for a year as simple integer vectors
+# Returns a list of 6 integer vectors (one per round), each containing
+# the winning seeds for that round
+precompute_actual <- function(data, target_year) {
+  actual <- data %>% filter(year == target_year)
+  round_of_map <- c(64, 32, 16, 8, 4, 2)
+  lapply(1:6, function(rnd) {
+    sort(actual %>% filter(round_of == round_of_map[rnd]) %>% pull(winning_team_seed))
+  })
+}
+ 
+# Fast multiset match count using sorted integer vectors
+count_matches_fast <- function(sim_seeds, actual_seeds) {
+  # Use table-based matching on small integer vectors
+  sim_t <- tabulate(sim_seeds, nbins = 16)
+  act_t <- tabulate(actual_seeds, nbins = 16)
+  sum(pmin(sim_t, act_t))
+}
+ 
+# Score a bracket against pre-computed actuals
+score_bracket_fast <- function(bracket, actual_rounds) {
+  score <- 0L
+  
+  # Rounds 1-3 (within regions)
+  for (rnd in 1:3) {
+    field <- c("r1", "r2", "r3")[rnd]
+    sim <- unlist(lapply(bracket$regions, function(r) r[[field]]))
+    score <- score + count_matches_fast(sim, actual_rounds[[rnd]]) * ESPN_POINTS[rnd]
+  }
+  
+  # Round 4 (E8)
+  sim_r4 <- sapply(bracket$regions, function(r) r$r4)
+  score <- score + count_matches_fast(sim_r4, actual_rounds[[4]]) * ESPN_POINTS[4]
+  
+  # Round 5 (F4)
+  score <- score + count_matches_fast(bracket$f4_winners, actual_rounds[[5]]) * ESPN_POINTS[5]
+  
+  # Round 6 (NCG)
+  score <- score + count_matches_fast(bracket$champion, actual_rounds[[6]]) * ESPN_POINTS[6]
+  
+  score
+}
+```
+
+```{r}
+run_experiment <- function(data, test_year, N = 1000, R = 10) {
+  cat("Year:", test_year, "\n")
+  
+  # Training years
+  train_years <- setdiff(1985:(test_year - 1), 2020)
+  train_years <- train_years[train_years %in% unique(data$year)]
+  
+  # Build model and probability matrix (once per year)
+  model <- build_power_model(data, train_years)
+  prob_mat <- build_prob_matrix(model)
+  
+  # Pre-compute actual results (once per year)
+  actual <- precompute_actual(data, test_year)
+  
+  # Fit truncated geometric parameters (once per year)
+  train_data <- data %>% filter(year %in% train_years)
+  q_f4  <- 1 / mean(train_data %>% filter(round == 4) %>% pull(winning_team_seed))
+  q_e8  <- 1 / mean(train_data %>% filter(round == 3) %>% pull(winning_team_seed))
+  q_ncg <- 1 / mean(train_data %>% filter(round == 5) %>% pull(winning_team_seed))
+  
+  # Generator functions (closures over prob_mat and q values)
+  generators <- list(
+    R64     = function() gen_R64(prob_mat),
+    E8      = function() gen_E8(prob_mat, q_e8),
+    F4A     = function() gen_F4A(prob_mat, q_f4),
+    NCG     = function() gen_NCG(prob_mat, q_ncg),
+    PickFav = function() gen_PF()
+  )
+  
+  results <- vector("list", length(generators))
+  names(results) <- names(generators)
+  
+  for (gen_name in names(generators)) {
+    t0 <- Sys.time()
+    gen_fn <- generators[[gen_name]]
+    
+    rep_max_scores <- numeric(R)
+    all_scores     <- numeric(N * R)
+    
+    for (rep in 1:R) {
+      offset <- (rep - 1) * N
+      best <- 0L
+      for (i in 1:N) {
+        b <- gen_fn()
+        s <- score_bracket_fast(b, actual)
+        all_scores[offset + i] <- s
+        if (s > best) best <- s
+      }
+      rep_max_scores[rep] <- best
+    }
+    
+    elapsed <- round(as.numeric(difftime(Sys.time(), t0, units = "secs")), 1)
+    cat("  ", gen_name, ":", elapsed, "sec\n")
+    
+    results[[gen_name]] <- tibble(
+      generator      = gen_name,
+      year           = test_year,
+      max_score_mean = mean(rep_max_scores),
+      max_score_sd   = sd(rep_max_scores),
+      mean_score     = mean(all_scores),
+      median_score   = median(all_scores),
+      scores         = list(all_scores),
+      max_scores     = list(rep_max_scores)
+    )
+  }
+  
+  bind_rows(results)
+}
+```
+
+```{r}
+# --- Run experiments ---------------------------------------------------------
+test_years <- c(2017, 2018, 2019, 2021, 2022, 2023, 2024)
+ 
+# START HERE for debugging — fast run
+N_brackets <- 500
+R_reps     <- 5
+ 
+# SCALE UP for final report — uncomment these:
+# N_brackets <- 5000
+# R_reps     <- 25
+ 
+cat("=== Bracket Generation Experiments ===\n")
+cat("Settings: N =", N_brackets, ", R =", R_reps,
+    ", Years =", length(test_years), "\n")
+cat("Total brackets:", N_brackets * R_reps * length(test_years) * 5, "\n\n")
+ 
+t_start <- Sys.time()
+all_results <- map_dfr(test_years, function(yr) {
+  run_experiment(games, yr, N = N_brackets, R = R_reps)
+})
+t_total <- round(as.numeric(difftime(Sys.time(), t_start, units = "secs")), 1)
+cat("\nTotal time:", t_total, "seconds\n")
+```
+
+```{r}
+# --- 7A: Max Score Table (reproduces paper's Table 6) ------------------------
+max_score_table <- all_results %>%
+  select(generator, year, max_score_mean) %>%
+  pivot_wider(names_from = generator, values_from = max_score_mean)
+ 
+knitr::kable(max_score_table, digits = 0,
+             caption = "Average Max Score by Generator and Year")
+ 
+# --- 7B: Max Score Grouped Bar Chart -----------------------------------------
+ggplot(all_results, aes(x = factor(year), y = max_score_mean, fill = generator)) +
+  geom_col(position = "dodge") +
+  geom_errorbar(
+    aes(ymin = max_score_mean - max_score_sd,
+        ymax = max_score_mean + max_score_sd),
+    position = position_dodge(0.9), width = 0.25
+  ) +
+  labs(title = "Average Max Score by Generator and Tournament Year",
+       x = "Year", y = "Avg Max Score (ESPN)", fill = "Generator") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2")
+ 
+# --- 7C: Score Distributions (density, one example year) ---------------------
+example_yr <- 2019
+ 
+year_scores <- all_results %>%
+  filter(year == example_yr) %>%
+  select(generator, scores) %>%
+  unnest(scores)
+ 
+ggplot(year_scores, aes(x = scores, fill = generator)) +
+  geom_density(alpha = 0.35) +
+  labs(title = paste("Bracket Score Distributions,", example_yr, "Tournament"),
+       x = "ESPN Score", y = "Density", fill = "Generator") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2")
+ 
+# --- 7D: Score Distribution Histograms (faceted) -----------------------------
+ggplot(year_scores, aes(x = scores)) +
+  geom_histogram(binwidth = 50, fill = "steelblue", color = "white") +
+  facet_wrap(~generator, scales = "free_y") +
+  labs(title = paste("Score Histograms by Generator,", example_yr),
+       x = "ESPN Score", y = "Count") +
+  theme_minimal()
+ 
+# --- 7E: Power Model Alpha Values -------------------------------------------
+full_model <- build_power_model(games, setdiff(1985:2023, 2020))
+ 
+# Round 1 matchup-specific alphas
+ggplot(full_model$r1_alphas,
+       aes(x = reorder(paste0(s1, "v", s2), -alpha), y = alpha)) +
+  geom_col(fill = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Round 1 α-Values by Seed Matchup",
+       subtitle = "Higher α → stronger seed more dominant; negative → weaker seed favored",
+       x = "Matchup", y = "α") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ 
+# Weighted average alpha by round
+ggplot(full_model$round_alphas, aes(x = factor(round), y = alpha_bar)) +
+  geom_col(fill = "coral") +
+  labs(title = "Weighted Average α by Round (Rounds 2–6)",
+       subtitle = "Low α in Round 4 (E8) → upsets common; high α in Round 6 → chalk",
+       x = "Round", y = "α̂ (weighted avg)") +
+  theme_minimal()
+ 
+# --- 7F: Historical Upset Rates by Round (EDA) -------------------------------
+upset_rates <- games %>%
+  mutate(upset = (winning_team_seed > losing_team_seed)) %>%
+  group_by(round) %>%
+  summarise(
+    n_games = n(), n_upsets = sum(upset),
+    upset_rate = n_upsets / n_games, .groups = "drop"
+  )
+ 
+ggplot(upset_rates, aes(x = factor(round), y = upset_rate)) +
+  geom_col(fill = "coral") +
+  geom_text(aes(label = scales::percent(upset_rate, accuracy = 0.1)), vjust = -0.3) +
+  labs(title = "Historical Upset Rate by Round (1985–present)",
+       x = "Round (1 = R64, ..., 6 = NCG)", y = "Upset Rate") +
+  theme_minimal() + ylim(0, 0.55)
+ 
+# --- 7G: Proportion Beating Pick Favorite ------------------------------------
+pf_scores <- all_results %>%
+  filter(generator == "PickFav") %>%
+  select(year, pf_max = max_score_mean)
+ 
+beat_pf <- all_results %>%
+  filter(generator != "PickFav") %>%
+  left_join(pf_scores, by = "year") %>%
+  rowwise() %>%
+  mutate(prop_beat_pf = mean(unlist(scores) >= pf_max)) %>%
+  ungroup() %>%
+  select(generator, year, prop_beat_pf)
+ 
+ggplot(beat_pf, aes(x = factor(year), y = prop_beat_pf,
+                    color = generator, group = generator)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  labs(title = "Proportion of Brackets Beating Pick Favorite",
+       x = "Year", y = "Proportion", color = "Generator") +
+  theme_minimal() + scale_color_brewer(palette = "Set2")
+ 
+# --- 7H: Final Four Seed Distribution (Truncated Geometric Fit) ---------------
+f4_seeds_actual <- games %>%
+  filter(round == 4) %>%
+  pull(winning_team_seed)
+ 
+q_hat <- 1 / mean(f4_seeds_actual)
+tg_pmf <- q_hat * (1 - q_hat)^(0:15)
+tg_pmf <- tg_pmf / sum(tg_pmf)
+ 
+f4_fit <- tibble(
+  seed = 1:16,
+  observed = sapply(1:16, function(s) sum(f4_seeds_actual == s)),
+  expected = tg_pmf * length(f4_seeds_actual)
+) %>%
+  pivot_longer(cols = c(observed, expected), names_to = "type", values_to = "count")
+ 
+ggplot(f4_fit, aes(x = factor(seed), y = count, fill = type)) +
+  geom_col(position = "dodge") +
+  labs(title = "Final Four Seeds: Observed vs Truncated Geometric Fit",
+       x = "Seed", y = "Count", fill = "") +
+  theme_minimal() +
+  scale_fill_manual(values = c("observed" = "steelblue", "expected" = "coral"))
+ 
+# --- 7I: Mean Score by Generator (overall) -----------------------------------
+ggplot(all_results, aes(x = generator, y = mean_score, fill = generator)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Distribution of Mean Bracket Score Across Years",
+       x = "Generator", y = "Mean Score per Pool") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2") +
+  theme(legend.position = "none")
+ 
+# --- 7J: Max Score Heatmap ---------------------------------------------------
+all_results %>%
+  select(generator, year, max_score_mean) %>%
+  ggplot(aes(x = factor(year), y = generator, fill = max_score_mean)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(max_score_mean)), size = 3.5) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Max Score Heatmap: Generator × Year",
+       x = "Year", y = "Generator", fill = "Avg Max Score") +
+  theme_minimal()
+```
