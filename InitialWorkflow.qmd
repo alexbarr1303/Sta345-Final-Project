@@ -1,29 +1,81 @@
 ---
-title: "AlexWorkflow"
+title: "InitialWorkflow"
 format: html
 ---
 
 ```{r}
 library(tidyverse)
 games <- read_csv("data/combined.csv")
- 
 ```
 
 ```{r}
-# Map round_of to round number (paper convention: Round 1 = R64, ..., Round 6 = NCG)
-games <- games %>%
+metrics <- read_csv("data/metrics.csv") %>%
+  mutate(AdjEM = AdjOE - AdjDE)
+
+metrics_slim <- metrics %>%
+  select(`Mapped ESPN Team Name`, Season, AdjOE, AdjDE, AdjEM)
+
+games_rated <- games %>%
+  left_join(metrics_slim, by = c("year" = "Season", "winning_team_name" = "Mapped ESPN Team Name")) %>%
+  rename(win_AdjEM = AdjEM, win_AdjOE = AdjOE, win_AdjDE = AdjDE) %>%
+  left_join(metrics_slim, by = c("year" = "Season", "losing_team_name" = "Mapped ESPN Team Name")) %>%
+  rename(lose_AdjEM = AdjEM, lose_AdjOE = AdjOE, lose_AdjDE = AdjDE)
+
+games_rated <- games_rated %>%
   mutate(round = case_when(
-    round_of == 64 ~ 1,
-    round_of == 32 ~ 2,
-    round_of == 16 ~ 3,
-    round_of ==  8 ~ 4,
-    round_of ==  4 ~ 5,
-    round_of ==  2 ~ 6
+    round_of == 64 ~ 1, round_of == 32 ~ 2, round_of == 16 ~ 3,
+    round_of ==  8 ~ 4, round_of ==  4 ~ 5, round_of ==  2 ~ 6
   ))
- 
-# Verify structure
-games %>% count(round, round_of)
-games %>% summarise(min_year = min(year), max_year = max(year), n_games = n())
+
+```
+
+```{r}
+# Build modeling dataset: reframe so each row is a matchup with a binary outcome
+model_data <- games_rated %>%
+  filter(!is.na(win_AdjEM), !is.na(lose_AdjEM)) %>%
+  mutate(
+    # From the stronger seed's perspective
+    s1 = pmin(winning_team_seed, losing_team_seed),
+    s2 = pmax(winning_team_seed, losing_team_seed),
+    s1_won = (winning_team_seed == s1),
+    # AdjEM difference from stronger seed's perspective
+    em_diff = ifelse(s1_won,
+                     win_AdjEM - lose_AdjEM,
+                     lose_AdjEM - win_AdjEM)
+  )
+
+# Fit logistic regression: P(stronger seed wins) ~ AdjEM difference
+fit <- glm(s1_won ~ em_diff, data = model_data, family = binomial)
+summary(fit)
+```
+
+```{r}
+# Average AdjEM by seed (among tournament teams)
+seed_ratings <- metrics %>%
+  filter(!is.na(Seed)) %>%
+  group_by(Seed) %>%
+  summarise(mean_AdjEM = mean(AdjEM, na.rm = TRUE), .groups = "drop")
+
+# Build 16x16x6 probability matrix using logistic model
+build_logistic_prob_matrix <- function(seed_ratings, fit) {
+  mat <- array(0.5, dim = c(16, 16, 6))
+  for (s1 in 1:16) {
+    for (s2 in 1:16) {
+      if (s1 == s2) next
+      em1 <- seed_ratings %>% filter(Seed == s1) %>% pull(mean_AdjEM)
+      em2 <- seed_ratings %>% filter(Seed == s2) %>% pull(mean_AdjEM)
+      if (length(em1) == 0 || length(em2) == 0) next
+      diff <- em1 - em2
+      p_s1 <- predict(fit, newdata = data.frame(em_diff = diff), type = "response")
+      for (rnd in 1:6) {
+        mat[s1, s2, rnd] <- p_s1
+      }
+    }
+  }
+  mat
+}
+
+logistic_prob_mat <- build_logistic_prob_matrix(seed_ratings, fit)
 ```
 
 ```{r}
@@ -297,31 +349,68 @@ score_bracket_fast <- function(bracket, actual_rounds) {
 run_experiment <- function(data, test_year, N = 1000, R = 10) {
   cat("Year:", test_year, "\n")
   
-  # Training years
-  train_years <- setdiff(1985:(test_year - 1), 2020)
+  train_years <- setdiff(2002:(test_year - 1), 2020)
   train_years <- train_years[train_years %in% unique(data$year)]
   
-  # Build model and probability matrix (once per year)
+  # Power model matrix (existing)
   model <- build_power_model(data, train_years)
   prob_mat <- build_prob_matrix(model)
   
-  # Pre-compute actual results (once per year)
+  # Logistic model matrix (new)
+  train_data_rated <- data %>%
+    filter(year %in% train_years, !is.na(win_AdjEM), !is.na(lose_AdjEM)) %>%
+    mutate(
+      s1 = pmin(winning_team_seed, losing_team_seed),
+      s2 = pmax(winning_team_seed, losing_team_seed),
+      s1_won = (winning_team_seed == s1),
+      em_diff = ifelse(s1_won, win_AdjEM - lose_AdjEM, lose_AdjEM - win_AdjEM)
+    )
+  
+  fit <- glm(s1_won ~ em_diff, data = train_data_rated, family = binomial)
+  
+  seed_ratings <- metrics_slim %>%
+    filter(Season %in% train_years) %>%
+    mutate(Seed = as.integer(str_extract(`Mapped ESPN Team Name`, "\\d+")))
+    # ^ that won't work — you need seed info. Use this instead:
+  
+  # Get average AdjEM per seed from training tournament teams
+  seed_ratings <- data %>%
+    filter(year %in% train_years, !is.na(win_AdjEM)) %>%
+    select(year, Seed = winning_team_seed, AdjEM = win_AdjEM) %>%
+    bind_rows(
+      data %>%
+        filter(year %in% train_years, !is.na(lose_AdjEM)) %>%
+        select(year, Seed = losing_team_seed, AdjEM = lose_AdjEM)
+    ) %>%
+    group_by(Seed) %>%
+    summarise(mean_AdjEM = mean(AdjEM), .groups = "drop")
+  
+  logistic_prob_mat <- build_logistic_prob_matrix(seed_ratings, fit)
+  
+  # Pre-compute actuals (existing)
   actual <- precompute_actual(data, test_year)
   
-  # Fit truncated geometric parameters (once per year)
-  train_data <- data %>% filter(year %in% train_years)
-  q_f4  <- 1 / mean(train_data %>% filter(round == 4) %>% pull(winning_team_seed))
-  q_e8  <- 1 / mean(train_data %>% filter(round == 3) %>% pull(winning_team_seed))
-  q_ncg <- 1 / mean(train_data %>% filter(round == 5) %>% pull(winning_team_seed))
+  # Truncated geometric params (existing)
+  train_games <- data %>% filter(year %in% train_years)
+  q_f4  <- 1 / mean(train_games %>% filter(round == 4) %>% pull(winning_team_seed))
+  q_e8  <- 1 / mean(train_games %>% filter(round == 3) %>% pull(winning_team_seed))
+  q_ncg <- 1 / mean(train_games %>% filter(round == 5) %>% pull(winning_team_seed))
   
-  # Generator functions (closures over prob_mat and q values)
+  # Add Logistic generator to the list
   generators <- list(
-    R64     = function() gen_R64(prob_mat),
-    E8      = function() gen_E8(prob_mat, q_e8),
-    F4A     = function() gen_F4A(prob_mat, q_f4),
-    NCG     = function() gen_NCG(prob_mat, q_ncg),
-    PickFav = function() gen_PF()
-  )
+  # Power model generators
+  Power_R64 = function() gen_R64(prob_mat),
+  Power_E8  = function() gen_E8(prob_mat, q_e8),
+  Power_F4A = function() gen_F4A(prob_mat, q_f4),
+  
+  # Logistic model generators
+  Log_R64   = function() gen_R64(logistic_prob_mat),
+  Log_E8    = function() gen_E8(logistic_prob_mat, q_e8),
+  Log_F4A   = function() gen_F4A(logistic_prob_mat, q_f4),
+  
+  # Baseline
+  PickFav   = function() gen_PF()
+)
   
   results <- vector("list", length(generators))
   names(results) <- names(generators)
@@ -383,7 +472,7 @@ cat("Total brackets:", N_brackets * R_reps * length(test_years) * 5, "\n\n")
  
 t_start <- Sys.time()
 all_results <- map_dfr(test_years, function(yr) {
-  run_experiment(games, yr, N = N_brackets, R = R_reps)
+  run_experiment(games_rated, yr, N = N_brackets, R = R_reps)
 })
 t_total <- round(as.numeric(difftime(Sys.time(), t_start, units = "secs")), 1)
 cat("\nTotal time:", t_total, "seconds\n")
@@ -435,7 +524,7 @@ ggplot(year_scores, aes(x = scores)) +
   theme_minimal()
  
 # --- 7E: Power Model Alpha Values -------------------------------------------
-full_model <- build_power_model(games, setdiff(1985:2023, 2020))
+full_model <- build_power_model(games_rated, setdiff(1985:2023, 2020))
  
 # Round 1 matchup-specific alphas
 ggplot(full_model$r1_alphas,
@@ -457,7 +546,7 @@ ggplot(full_model$round_alphas, aes(x = factor(round), y = alpha_bar)) +
   theme_minimal()
  
 # --- 7F: Historical Upset Rates by Round (EDA) -------------------------------
-upset_rates <- games %>%
+upset_rates <- games_rated %>%
   mutate(upset = (winning_team_seed > losing_team_seed)) %>%
   group_by(round) %>%
   summarise(
@@ -493,7 +582,7 @@ ggplot(beat_pf, aes(x = factor(year), y = prop_beat_pf,
   theme_minimal() + scale_color_brewer(palette = "Set2")
  
 # --- 7H: Final Four Seed Distribution (Truncated Geometric Fit) ---------------
-f4_seeds_actual <- games %>%
+f4_seeds_actual <- games_rated %>%
   filter(round == 4) %>%
   pull(winning_team_seed)
  
