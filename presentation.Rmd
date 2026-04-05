@@ -1,0 +1,329 @@
+---
+title: "Improving Bracket Generation Models for NCAA March Madness"
+subtitle: "Critiquing the Power Model & Introducing Team-Level Efficiency"
+author: "Alejandro Alfaro and Alex Barroso"
+date: "STA345 — Spring 2026"
+output:
+  ioslides_presentation:
+    widescreen: true
+    self_contained: true
+---
+
+<style>
+slides > slide {
+  overflow: auto;
+}
+slides > slide:not(.nobackground):after {
+  content: '' !important;
+  display: none !important;
+}
+slides > slide:not(.nobackground):before {
+  content: '' !important;
+  display: none !important;
+}
+.slide-number {
+  display: none !important;
+}
+aside.gdbar {
+  display: none !important;
+}
+table {
+  font-size: 14px;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 4.2, dpi = 150)
+suppressPackageStartupMessages({ library(tidyverse); library(knitr) })
+source("R/utils.R")
+source("R/models.R")
+source("R/generators.R")
+source("R/scoring.R")
+source("R/diagnostics.R")
+
+games <- read_csv("data/combined.csv", show_col_types = FALSE) %>%
+  mutate(round = case_when(
+    round_of == 64 ~ 1, round_of == 32 ~ 2, round_of == 16 ~ 3,
+    round_of == 8 ~ 4, round_of == 4 ~ 5, round_of == 2 ~ 6))
+
+metrics <- read_csv("data/metrics.csv", show_col_types = FALSE) %>%
+  mutate(AdjEM = AdjOE - AdjDE)
+
+ms <- metrics %>% select(team = `Mapped ESPN Team Name`, Season, AdjEM)
+games_rated <- games %>%
+  left_join(ms, by = c("year" = "Season", "winning_team_name" = "team")) %>% rename(win_AdjEM = AdjEM) %>%
+  left_join(ms, by = c("year" = "Season", "losing_team_name" = "team")) %>% rename(lose_AdjEM = AdjEM)
+
+all_train <- setdiff(sort(unique(games$year)), 2020)
+results <- readRDS("data/presentation_results.rds")
+```
+
+## The Bracket Challenge
+
+- **63 games**, over **9 x 10^18** possible bracket configurations
+- A perfect bracket is virtually impossible
+- **Key insight:** generate a *pool* of brackets where at least one scores highly
+- Ludden et al. (2020) proposed a framework with two parts:
+
+| Component | Purpose |
+|-----------|---------|
+| **Probability Model** | Estimate P(seed s1 beats seed s2) by round |
+| **Generator Strategy** | Use those probabilities to build complete brackets |
+
+- Scored using **ESPN's system:** 10, 20, 40, 80, 160, 320 points per round (1920 max)
+
+## Our Data
+
+**Tournament Data** (`combined.csv`)
+
+- NCAA tournament game results, **1985 -- 2024**
+- 2,457 games across 39 seasons (excluding 2020)
+- Features: seeds, team names, scores, round
+
+**Team Efficiency Metrics** (`metrics.csv`)
+
+- KenPom-style adjusted efficiency ratings, **2002 -- 2026**
+- **AdjOE** = Adjusted Offensive Efficiency
+- **AdjDE** = Adjusted Defensive Efficiency
+- **AdjEM = AdjOE - AdjDE** = overall team quality, adjusted for opponent strength
+
+## The Power Model: What It Claims
+
+Ludden et al.'s probability model uses a "power" parameterization:
+
+$$P(s_1 \text{ beats } s_2) = \frac{(s_2/s_1)^{\alpha_j}}{1 + (s_2/s_1)^{\alpha_j}}$$
+
+- **Round 1:** A separate alpha for each of the 8 fixed matchups (1v16, 2v15, ...)
+- **Rounds 2--6:** A single pooled alpha per round
+
+**The claim:** alpha captures how "upset-prone" each round is
+
+## The Power Model: How Alpha Is Computed
+
+For each Round 1 matchup (e.g., 5 vs 12):
+
+1. **Count** historical wins: seed 5 wins 101 out of 156 games
+2. **Compute** observed win rate: p = 101/156 = 0.647
+3. **Solve** for alpha using the formula: alpha = 0.694
+
+For Rounds 2--6: compute alpha for each matchup in the round, then take a weighted average to get one alpha per round.
+
+**But what happens when we predict with this alpha?**
+
+## Problem 1: Circularity
+
+Plugging alpha = 0.694 back into the formula gives... **0.647 again.**
+
+**The prediction equals the observed frequency exactly.** Every R1 matchup:
+
+```{r circularity}
+ct <- build_circularity_table(games_rated, all_train)
+kable(ct, align = "c")
+```
+
+## Problem 2: Crude Pooling (Rounds 2--6)
+
+For Rounds 2--6, the Power Model uses **one alpha per round.** But within each round, actual win rates vary dramatically:
+
+```{r pooling, fig.height=3.5}
+plot_round_pooling(games_rated, all_train)
+```
+
+## Problem 3: No Real Learning
+
+| Property | Power Model | A Real Model |
+|----------|------------|--------------|
+| Estimation | Algebraic inversion | Optimization (MLE) |
+| R1 predictions | = observed frequencies | Learned from patterns |
+| Rounds 2--6 | One parameter per round | Varies by matchup + round |
+| Team quality | All same-seeds identical | Can use team data |
+| Generalization | Only reproduces history | Predicts unseen matchups |
+
+**The Power Model is a frequency table with mathematical notation.**
+
+## The Generators (Replicated from Paper)
+
+The paper's real contribution: **generator strategies** that turn probabilities into brackets.
+
+| Generator | Strategy | How It Works |
+|-----------|----------|-------------|
+| **R64** | Full Stochastic | Simulate all 63 games from R1 forward |
+| **E8** | Elite Eight Anchor | Fix E8 seeds first, simulate rest |
+| **F4A** | Final Four Anchor | Fix F4 seeds, simulate from there |
+| **NCG** | Championship Anchor | Fix championship matchup, simulate rest |
+
+We replicated all of these. They work with **any** probability matrix -- our models plug directly into the paper's generators.
+
+## The Seed-Only Ceiling
+
+We tried replacing the Power Model with real ML models using only seed data:
+
+- **Logistic Regression** and **Random Forest** on seed features
+
+**Result:** All models scored ~1620 avg max. Power, LogReg, RF, and Bradley-Terry were all within ~5 points of each other.
+
+**Why?** Seeds contain a finite amount of predictive information. Every reasonable model extracts the same signal.
+
+**To do better, we need new information.**
+
+## Breaking Through: Team Efficiency Data
+
+Not all 1-seeds are created equal:
+
+```{r adjem-example}
+ex <- metrics %>%
+  filter(Season == 2024, !is.na(Seed), Seed == 1,
+         Region %in% c("East","West","Midwest","South")) %>%
+  select(Team = `Mapped ESPN Team Name`, Seed, Region, AdjEM) %>%
+  arrange(desc(AdjEM))
+kable(ex, digits = 1, caption = "2024 Tournament 1-Seeds: Same seed, very different quality")
+```
+
+**AdjEM** measures actual team quality. The Power Model treats all four of these 1-seeds identically.
+
+## Our Model: AdjEM Logistic Regression
+
+We trained a logistic regression on historical tournament games:
+
+**logit(P) = B0 + B1 x AdjEM_diff x round + B2 x log(s2/s1) + B3 x seed_diff**
+
+| Feature | What It Captures |
+|---------|-----------------|
+| **AdjEM_diff** | Efficiency gap between the two teams |
+| **AdjEM_diff x round** | Efficiency advantages matter differently by round |
+| **log(s2/s1)** | Structural seed ratio (bracket info) |
+| **seed_diff** | How far apart the seeds are |
+
+Trained on all tournament games from 2002 onward (~1,300 games)
+
+## Key Innovation: Region-Specific Matrices
+
+The Power Model uses **one matrix** for all 4 regions. We build **four separate matrices:**
+
+```{r region-example}
+tourney_regions <- c("East","West","Midwest","South")
+ex2 <- metrics %>%
+  filter(Season == 2024, Region %in% tourney_regions, Seed %in% c("1","5","12")) %>%
+  mutate(Seed = as.integer(Seed)) %>%
+  select(Team = `Mapped ESPN Team Name`, Seed, Region, AdjEM) %>%
+  arrange(Region, Seed)
+kable(ex2, digits = 1,
+      caption = "Each region has different teams, so each gets its own probability matrix")
+```
+
+## How the Pieces Fit Together
+
+```{r pipeline-diagram, fig.height=3.8, fig.width=8}
+library(ggplot2)
+
+boxes <- data.frame(
+  x = c(5, 2, 4, 6, 8, 5, 5),
+  y = c(6, 4, 4, 4, 4, 2, 0),
+  label = c("Team Metrics\n(AdjEM by year)",
+            "East\nMatrix", "West\nMatrix", "Midwest\nMatrix", "South\nMatrix",
+            "R64 Generator\n(from paper)",
+            "Bracket Pool\n(scored ESPN)"),
+  fill = c("#3498db", "#2ecc71","#2ecc71","#2ecc71","#2ecc71", "#e67e22", "#e74c3c")
+)
+
+arrows <- data.frame(
+  x = c(5, 5, 5, 5, 2, 4, 6, 8, 5),
+  xend = c(2, 4, 6, 8, 5, 5, 5, 5, 5),
+  y = c(5.5, 5.5, 5.5, 5.5, 3.5, 3.5, 3.5, 3.5, 1.5),
+  yend = c(4.5, 4.5, 4.5, 4.5, 2.5, 2.5, 2.5, 2.5, 0.5)
+)
+
+ggplot() +
+  geom_segment(data = arrows, aes(x=x, xend=xend, y=y, yend=yend),
+               arrow = arrow(length = unit(0.15, "inches")), color = "gray40", linewidth = 0.8) +
+  geom_label(data = boxes, aes(x=x, y=y, label=label, fill=fill),
+             color = "white", fontface = "bold", size = 3.5, label.padding = unit(0.5, "lines"),
+             label.size = 0) +
+  scale_fill_identity() +
+  theme_void() +
+  coord_cartesian(xlim = c(0, 10), ylim = c(-0.8, 7)) +
+  labs(title = "Our Pipeline: Team Data + Paper's Generators = Better Brackets")
+```
+
+## Results: AdjEM vs Power Model
+
+```{r results-table}
+res_wide <- results %>%
+  mutate(max_score = round(max_score, 0)) %>%
+  pivot_wider(names_from = model, values_from = c(max_score, sd)) %>%
+  mutate(Improvement = max_score_AdjEM - max_score_Power) %>%
+  select(Year = year, Power = max_score_Power, AdjEM = max_score_AdjEM, Improvement)
+kable(res_wide, align = "c",
+      caption = "R64 Generator, N=500 brackets, R=5 replications")
+```
+
+```{r results-summary}
+pw <- results %>% filter(model == "Power") %>% pull(max_score)
+em <- results %>% filter(model == "AdjEM") %>% pull(max_score)
+```
+
+**Average improvement: +`r round(mean(em - pw), 0)` points | Wins `r sum(em > pw)` / `r length(pw)` years**
+
+## Results: Visual Comparison
+
+```{r results-plot, fig.height=3.8, fig.width=8}
+results %>%
+  mutate(model = factor(model, levels = c("Power", "AdjEM"))) %>%
+  ggplot(aes(x = factor(year), y = max_score, fill = model)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_errorbar(aes(ymin = max_score - sd, ymax = max_score + sd),
+                position = position_dodge(0.6), width = 0.2) +
+  scale_fill_manual(values = c("Power" = "#e74c3c", "AdjEM" = "#2ecc71")) +
+  coord_cartesian(ylim = c(1200, 1850)) +
+  labs(x = "Tournament Year", y = "Avg Max ESPN Score",
+       fill = "Model", title = "AdjEM Consistently Outperforms Power Model") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top")
+```
+
+## When AdjEM Loses: The Chaos Years
+
+AdjEM loses in 3 years -- all extreme upset tournaments:
+
+| Year | What Happened | Why AdjEM Struggled |
+|------|--------------|---------------------|
+| **2014** | 7-seed UConn wins it all | UConn's AdjEM (22) was outside top 10 |
+| **2018** | 16-seed UMBC beats 1-seed Virginia | AdjEM was very confident in Virginia (29.5) |
+| **2022** | 15-seed Saint Peter's makes Elite 8 | Efficiency numbers couldn't predict this |
+
+**Pattern:** AdjEM trusts regular-season performance. When March Madness chaos happens, no efficiency metric can predict it. But the big wins in the other 8 years more than compensate.
+
+## Key Takeaways
+
+| Finding | Detail |
+|---------|--------|
+| **Power Model is circular** | Predictions = observed frequencies for R1; one alpha per round for R2-6 |
+| **Seed-only ceiling (~1620)** | LogReg, RF, Bradley-Terry all converge -- seeds have finite info |
+| **AdjEM breaks through** | Region-specific matrices capture real team quality: **+48 avg, 8/11 years** |
+| **Generators are the real contribution** | R64, E8, F4A, NCG work with any model -- better model = better brackets |
+
+## Future Work
+
+- **Additional features:** tempo, 3-point rate, experience, height -- richer matchup models
+- **Blended approach:** 50/50 Power + AdjEM reduces worst-case losses in chaos years
+- **2025/2026 prediction:** metrics.csv includes current-year data for live predictions
+- **Optimal pool construction:** diversifying brackets across temperature/generator combos
+
+## Interactive Demo & Assignment
+
+**Shiny App** -- explore everything from this presentation:
+
+- Tab 1: Power Model critique (circularity table, alpha plots)
+- Tab 2: Generate brackets with Power vs AdjEM, side-by-side
+- Tab 3: Run experiments comparing models across years
+
+**Student Assignment** (distributed separately):
+
+- Derive the Power Model's circularity mathematically
+- Implement the Power Model in R from scratch
+- Build your own probability model using the provided data
+- Compare your model against the Power Model using the generators
+
+**Thank you!**

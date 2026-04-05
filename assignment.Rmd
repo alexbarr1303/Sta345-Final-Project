@@ -1,0 +1,478 @@
+---
+title: "NCAA March Madness Bracket Models — Student Assignment"
+subtitle: "STA345 — Spring 2026"
+author: "Alejandro Alfaro and Alex Barroso"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+In this assignment you will:
+
+1. **Understand** the Power Model from Ludden et al. (2020) and prove its circularity
+2. **Implement** the Power Model from scratch in R
+3. **Build** your own improved probability model
+4. **Evaluate** your model against the Power Model using bracket generators
+
+**Estimated time:** 1.5 -- 2 hours
+
+**Data provided:**
+
+- `data/combined.csv` — NCAA tournament game results (1985--2024)
+- `data/metrics.csv` — Team-level adjusted efficiency metrics (2002--2026)
+
+---
+
+# Part 1: Understanding the Power Model (30 min)
+
+## 1.1 Load and explore the data
+
+```{r}
+library(tidyverse)
+
+games <- read_csv("data/combined.csv", show_col_types = FALSE) %>%
+  mutate(round = case_when(
+    round_of == 64 ~ 1, round_of == 32 ~ 2, round_of == 16 ~ 3,
+    round_of == 8  ~ 4, round_of == 4  ~ 5, round_of == 2  ~ 6
+  ))
+
+# Look at the data
+glimpse(games)
+```
+
+**Q1.1:** How many total games are in the dataset? How many tournament years? What columns are available?
+
+```{r}
+# YOUR CODE HERE
+```
+
+## 1.2 Compute Round 1 win rates
+
+In March Madness Round 1, the matchups are always fixed by seed: 1 vs 16, 2 vs 15, 3 vs 14, 4 vs 13, 5 vs 12, 6 vs 11, 7 vs 10, 8 vs 9.
+
+```{r}
+r1_stats <- games %>%
+  filter(round == 1) %>%
+  mutate(
+    s1 = pmin(winning_team_seed, losing_team_seed),  # better seed
+    s2 = pmax(winning_team_seed, losing_team_seed),  # worse seed
+    s1_won = (winning_team_seed == s1)                # did better seed win?
+  ) %>%
+  group_by(s1, s2) %>%
+  summarise(
+    games = n(),
+    wins = sum(s1_won),
+    p_bar = mean(s1_won),
+    .groups = "drop"
+  )
+
+r1_stats
+```
+
+**Q1.2:** Which Round 1 matchup has the closest win rate to 50/50? Which is the most lopsided? Do any results surprise you?
+
+## 1.3 The Power Model formula
+
+The Power Model predicts:
+
+$$P(s_1 \text{ beats } s_2) = \frac{s_2^{\alpha}}{s_1^{\alpha} + s_2^{\alpha}}$$
+
+where $\alpha$ is a parameter. For Round 1, $\alpha$ is computed separately for each matchup by inverting the formula:
+
+$$\alpha = \frac{\text{logit}(\bar{p})}{\log(1/s_1) - \log(1/s_2)}$$
+
+where $\bar{p}$ is the observed win rate and $\text{logit}(p) = \log(p / (1-p))$.
+
+**Q1.3 (Derivation):** Starting from the Power Model formula, show algebraically that solving for $\alpha$ from $\bar{p}$ and then plugging it back into the formula returns $\bar{p}$ exactly. In other words, prove that the Power Model is circular for Round 1.
+
+*Hint:* Start by writing $\bar{p} = s_2^{\alpha} / (s_1^{\alpha} + s_2^{\alpha})$, take the logit of both sides, solve for $\alpha$, then substitute back.
+
+**YOUR DERIVATION HERE** (write it out by hand or in LaTeX)
+
+## 1.4 Verify computationally
+
+Now verify your derivation with code:
+
+```{r}
+compute_alpha <- function(p_bar, s1, s2) {
+  logit_p <- log(p_bar / (1 - p_bar))
+  alpha <- logit_p / (log(1/s1) - log(1/s2))
+  return(alpha)
+}
+
+power_model_prob <- function(alpha, s1, s2) {
+  s2^alpha / (s1^alpha + s2^alpha)
+}
+
+# Compute alpha and p_hat for each R1 matchup
+r1_check <- r1_stats %>%
+  rowwise() %>%
+  mutate(
+    alpha = compute_alpha(p_bar, s1, s2),
+    p_hat = power_model_prob(alpha, s1, s2),
+    difference = abs(p_bar - p_hat)
+  ) %>%
+  ungroup()
+
+r1_check %>% select(s1, s2, p_bar, alpha, p_hat, difference)
+```
+
+**Q1.4:** What is the largest value in the `difference` column? What does this tell you about the Power Model?
+
+---
+
+# Part 2: Implement the Power Model (30 min)
+
+## 2.1 Build the full probability matrix
+
+The Power Model produces a 16 x 16 x 6 array: `prob_mat[s1, s2, round]` gives the probability that seed `s1` beats seed `s2` in a given round.
+
+- **Round 1:** Use matchup-specific alphas (computed above)
+- **Rounds 2--6:** Compute a single pooled alpha per round from all games in that round
+
+Complete the function below:
+
+```{r}
+build_power_model <- function(data, train_years) {
+  train <- data %>%
+    filter(year %in% train_years) %>%
+    mutate(
+      s1 = pmin(winning_team_seed, losing_team_seed),
+      s2 = pmax(winning_team_seed, losing_team_seed),
+      s1_won = (winning_team_seed == s1)
+    )
+
+  # Round 1: matchup-specific alphas
+  r1_alphas <- train %>%
+    filter(round == 1) %>%
+    group_by(s1, s2) %>%
+    summarise(p_bar = mean(s1_won), n = n(), .groups = "drop") %>%
+    rowwise() %>%
+    mutate(alpha = compute_alpha(p_bar, s1, s2)) %>%
+    ungroup()
+
+  # Rounds 2-6: pooled alpha per round
+  # TODO: Complete this section
+  # 1. Filter training data for rounds >= 2 where s1 != s2
+  # 2. For each (round, s1, s2) combination, compute p_bar and alpha
+  # 3. For each round, compute the weighted mean of alpha (weighted by n)
+  round_alphas <- train %>%
+    filter(round >= 2, s1 != s2) %>%
+    # YOUR CODE HERE: group, summarise, compute alphas, then get weighted mean per round
+    group_by(round, s1, s2) %>%
+    summarise(p_bar = mean(s1_won), n = n(), .groups = "drop") %>%
+    rowwise() %>%
+    mutate(alpha = compute_alpha(p_bar, s1, s2)) %>%
+    ungroup() %>%
+    group_by(round) %>%
+    summarise(alpha_bar = weighted.mean(alpha, w = n), .groups = "drop")
+
+  list(r1_alphas = r1_alphas, round_alphas = round_alphas)
+}
+```
+
+## 2.2 Build the probability matrix
+
+```{r}
+build_prob_matrix <- function(model) {
+  mat <- array(0.5, dim = c(16, 16, 6))
+
+  # Look up round-level alphas
+  round_alpha_lookup <- rep(1, 6)
+  for (i in seq_len(nrow(model$round_alphas))) {
+    round_alpha_lookup[model$round_alphas$round[i]] <- model$round_alphas$alpha_bar[i]
+  }
+
+  for (s1 in 1:15) {
+    for (s2 in (s1+1):16) {
+      # Round 1: matchup-specific alpha
+      row <- model$r1_alphas %>% filter(.data$s1 == !!s1, .data$s2 == !!s2)
+      if (nrow(row) > 0) {
+        p <- power_model_prob(row$alpha[1], s1, s2)
+      } else {
+        p <- power_model_prob(1.0, s1, s2)  # default
+      }
+      mat[s1, s2, 1] <- p
+      mat[s2, s1, 1] <- 1 - p
+
+      # Rounds 2-6: round-level alpha
+      for (rnd in 2:6) {
+        p <- power_model_prob(round_alpha_lookup[rnd], s1, s2)
+        mat[s1, s2, rnd] <- p
+        mat[s2, s1, rnd] <- 1 - p
+      }
+    }
+  }
+  mat
+}
+
+# Test it
+train_years <- setdiff(1985:2023, 2020)
+model <- build_power_model(games, train_years)
+prob_mat <- build_prob_matrix(model)
+
+# Check: P(1-seed beats 16-seed in R1)
+cat("P(1 beats 16, R1):", round(prob_mat[1, 16, 1], 4), "\n")
+cat("P(8 beats 9, R1):", round(prob_mat[8, 9, 1], 4), "\n")
+cat("P(1 beats 2, R2):", round(prob_mat[1, 2, 2], 4), "\n")
+```
+
+**Q2.2:** Does `P(1 beats 16, R1)` match the observed frequency from Part 1? Why or why not?
+
+---
+
+# Part 3: Bracket Generation & Scoring (20 min)
+
+## 3.1 The R64 Generator
+
+The simplest generator: simulate every game using the probability matrix.
+
+```{r}
+# Standard NCAA bracket pairings
+REGION_SEEDS <- matrix(c(1,16, 8,9, 5,12, 4,13, 6,11, 3,14, 7,10, 2,15),
+                       ncol = 2, byrow = TRUE)
+
+sim_game <- function(seed_a, seed_b, rnd, prob_mat) {
+  p_a <- prob_mat[seed_a, seed_b, rnd]
+  if (is.na(p_a)) p_a <- 0.5
+  if (runif(1) < p_a) seed_a else seed_b
+}
+
+simulate_region <- function(prob_mat) {
+  r1 <- integer(8)
+  for (i in 1:8) r1[i] <- sim_game(REGION_SEEDS[i,1], REGION_SEEDS[i,2], 1L, prob_mat)
+  r2 <- integer(4)
+  for (i in 1:4) r2[i] <- sim_game(r1[2*i-1], r1[2*i], 2L, prob_mat)
+  r3 <- c(sim_game(r2[1], r2[2], 3L, prob_mat), sim_game(r2[3], r2[4], 3L, prob_mat))
+  r4 <- sim_game(r3[1], r3[2], 4L, prob_mat)
+  list(r1 = r1, r2 = r2, r3 = r3, r4 = r4)
+}
+
+gen_R64 <- function(prob_mat) {
+  reg <- lapply(1:4, function(i) simulate_region(prob_mat))
+  f4 <- sapply(reg, function(r) r$r4)
+  f4w <- c(sim_game(f4[1], f4[2], 5L, prob_mat),
+           sim_game(f4[3], f4[4], 5L, prob_mat))
+  champ <- sim_game(f4w[1], f4w[2], 6L, prob_mat)
+  list(regions = reg, f4_seeds = f4, f4_winners = f4w, champion = champ)
+}
+
+# Generate one bracket
+set.seed(42)
+bracket <- gen_R64(prob_mat)
+cat("Champion seed:", bracket$champion, "\n")
+cat("Final Four seeds:", bracket$f4_seeds, "\n")
+```
+
+## 3.2 ESPN Scoring
+
+```{r}
+ESPN_POINTS <- c(10L, 20L, 40L, 80L, 160L, 320L)
+
+precompute_actual <- function(data, target_year) {
+  actual <- data %>% filter(year == target_year)
+  round_of_map <- c(64, 32, 16, 8, 4, 2)
+  lapply(1:6, function(rnd) {
+    sort(actual %>% filter(round_of == round_of_map[rnd]) %>% pull(winning_team_seed))
+  })
+}
+
+count_matches <- function(sim_seeds, actual_seeds) {
+  sim_t <- tabulate(sim_seeds, nbins = 16)
+  act_t <- tabulate(actual_seeds, nbins = 16)
+  sum(pmin(sim_t, act_t))
+}
+
+score_bracket <- function(bracket, actual_rounds) {
+  score <- 0L
+  for (rnd in 1:3) {
+    field <- c("r1", "r2", "r3")[rnd]
+    sim <- unlist(lapply(bracket$regions, function(r) r[[field]]))
+    score <- score + count_matches(sim, actual_rounds[[rnd]]) * ESPN_POINTS[rnd]
+  }
+  sim_r4 <- sapply(bracket$regions, function(r) r$r4)
+  score <- score + count_matches(sim_r4, actual_rounds[[4]]) * ESPN_POINTS[4]
+  score <- score + count_matches(bracket$f4_winners, actual_rounds[[5]]) * ESPN_POINTS[5]
+  score <- score + count_matches(bracket$champion, actual_rounds[[6]]) * ESPN_POINTS[6]
+  score
+}
+
+# Score the bracket against 2024 actual results
+actual_2024 <- precompute_actual(games, 2024)
+cat("Bracket ESPN score:", score_bracket(bracket, actual_2024), "/ 1920\n")
+```
+
+## 3.3 Generate a pool and find the max
+
+```{r}
+set.seed(123)
+N <- 200
+scores <- sapply(1:N, function(i) {
+  b <- gen_R64(prob_mat)
+  score_bracket(b, actual_2024)
+})
+
+cat("Pool of", N, "brackets:\n")
+cat("  Max score:", max(scores), "\n")
+cat("  Mean score:", round(mean(scores), 0), "\n")
+cat("  Median score:", median(scores), "\n")
+```
+
+**Q3.3:** Run this with different values of N (100, 500, 1000). How does the max score change? Why?
+
+---
+
+# Part 4: Build Your Own Model (30 min)
+
+Now it's your turn. Build a model that outperforms the Power Model.
+
+## 4.1 Load team efficiency data
+
+```{r}
+metrics <- read_csv("data/metrics.csv", show_col_types = FALSE) %>%
+  mutate(AdjEM = AdjOE - AdjDE)
+
+# Join to game data
+metrics_slim <- metrics %>%
+  select(team = `Mapped ESPN Team Name`, Season, AdjEM)
+
+games_rated <- games %>%
+  left_join(metrics_slim, by = c("year" = "Season", "winning_team_name" = "team")) %>%
+  rename(win_AdjEM = AdjEM) %>%
+  left_join(metrics_slim, by = c("year" = "Season", "losing_team_name" = "team")) %>%
+  rename(lose_AdjEM = AdjEM)
+
+# Look at the relationship between AdjEM difference and winning
+games_rated %>%
+  filter(!is.na(win_AdjEM), !is.na(lose_AdjEM)) %>%
+  mutate(em_diff = win_AdjEM - lose_AdjEM) %>%
+  ggplot(aes(x = em_diff)) +
+  geom_histogram(bins = 40, fill = "steelblue", alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "AdjEM Difference (Winner - Loser)", y = "Count",
+       title = "Winners tend to have higher AdjEM, but not always") +
+  theme_minimal()
+```
+
+## 4.2 Build a probability matrix using AdjEM
+
+**Your task:** Build a 16 x 16 x 6 probability matrix using the AdjEM data. Here's a skeleton:
+
+```{r}
+build_your_model <- function(data, train_years) {
+  # Step 1: Filter training data to games with AdjEM
+  train <- data %>%
+    filter(year %in% train_years, !is.na(win_AdjEM), !is.na(lose_AdjEM)) %>%
+    mutate(
+      s1 = pmin(winning_team_seed, losing_team_seed),
+      s2 = pmax(winning_team_seed, losing_team_seed),
+      s1_won = as.integer(winning_team_seed == s1),
+      em_diff = ifelse(s1_won == 1, win_AdjEM - lose_AdjEM, lose_AdjEM - win_AdjEM)
+    ) %>%
+    filter(s1 != s2)
+
+  # Step 2: Fit a logistic regression
+  # TODO: Try different formulas. Some ideas:
+  #   - s1_won ~ em_diff
+  #   - s1_won ~ em_diff + round
+  #   - s1_won ~ em_diff * round + log(s2/s1)
+  fit <- glm(s1_won ~ em_diff, data = train, family = binomial())
+
+  # Step 3: Get average AdjEM by seed from training data
+  seed_em <- bind_rows(
+    train %>% select(seed = winning_team_seed, em = win_AdjEM),
+    train %>% select(seed = losing_team_seed, em = lose_AdjEM)
+  ) %>%
+    group_by(seed) %>%
+    summarise(mean_em = mean(em, na.rm = TRUE), .groups = "drop")
+
+  # Step 4: Build probability matrix
+  mat <- array(0.5, dim = c(16, 16, 6))
+  for (s1 in 1:15) {
+    for (s2 in (s1+1):16) {
+      em1 <- seed_em$mean_em[seed_em$seed == s1]
+      em2 <- seed_em$mean_em[seed_em$seed == s2]
+      if (length(em1) == 0 || length(em2) == 0) next
+      # TODO: Predict probability using your model
+      p <- predict(fit, newdata = data.frame(em_diff = em1 - em2), type = "response")
+      p <- max(0.01, min(0.99, p))
+      for (rnd in 1:6) {
+        mat[s1, s2, rnd] <- p
+        mat[s2, s1, rnd] <- 1 - p
+      }
+    }
+  }
+  mat
+}
+```
+
+## 4.3 Compare your model to the Power Model
+
+```{r}
+# Test on 2024
+train_yrs <- setdiff(2002:2023, 2020)
+train_yrs <- train_yrs[train_yrs %in% unique(games_rated$year)]
+
+# Build both models
+power_mat <- build_prob_matrix(build_power_model(games_rated, train_yrs))
+your_mat <- build_your_model(games_rated, train_yrs)
+
+actual_2024 <- precompute_actual(games_rated, 2024)
+
+# Generate pools and compare
+set.seed(456)
+N <- 500
+
+power_scores <- sapply(1:N, function(i) score_bracket(gen_R64(power_mat), actual_2024))
+your_scores <- sapply(1:N, function(i) score_bracket(gen_R64(your_mat), actual_2024))
+
+cat("=== 2024 Results (N=500 brackets) ===\n")
+cat("Power Model -- Max:", max(power_scores), " Mean:", round(mean(power_scores), 0), "\n")
+cat("Your Model  -- Max:", max(your_scores), " Mean:", round(mean(your_scores), 0), "\n")
+cat("Improvement:", max(your_scores) - max(power_scores), "points\n")
+```
+
+**Q4.3:** Run this comparison for multiple years (2019, 2021, 2022, 2023, 2024). Does your model consistently beat the Power Model?
+
+## 4.4 Challenge: Can you do better?
+
+Ideas to try:
+
+- Add `round` as a feature (or interact it with `em_diff`)
+- Use `AdjOE` and `AdjDE` separately instead of just `AdjEM`
+- Try a random forest instead of logistic regression
+- Use year-specific AdjEM values instead of averages across all training years
+
+```{r}
+# YOUR IMPROVED MODEL HERE
+```
+
+---
+
+# Part 5: Short Answer Questions (10 min)
+
+**Q5.1:** In your own words, explain why the Power Model's alpha parameterization is circular for Round 1 matchups. Why doesn't this matter for Rounds 2--6?
+
+**Q5.2:** The Power Model uses one alpha per round for Rounds 2--6. Give a specific example of why this is problematic (name two different seed matchups in the same round that should have very different win probabilities).
+
+**Q5.3:** Why does using team-level AdjEM data break through the seed-only performance ceiling? What information does AdjEM capture that seed numbers alone cannot?
+
+**Q5.4:** Our AdjEM model loses to the Power Model in 3 out of 11 test years (2014, 2018, 2022). All three were extremely upset-heavy tournaments. Why does the AdjEM model struggle in these years? What could you do to make the model more robust?
+
+---
+
+# Submission
+
+Submit:
+
+1. This `.Rmd` file with all code cells completed and questions answered
+2. A short summary (3--5 sentences) of your model's performance vs the Power Model
