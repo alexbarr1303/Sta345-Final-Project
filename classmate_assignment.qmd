@@ -130,7 +130,7 @@ results <- tibble(
 
 *Your answer:*
 
-## Part 4: Tweak the Model 
+## Part 4: Tweak the Model
 
 The power model's α values control upset frequency. What if you think the model is **too conservative** (doesn't predict enough upsets) or **too aggressive**?
 
